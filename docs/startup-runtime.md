@@ -116,6 +116,12 @@ These are measured on one executable; treat them as hypotheses for others.
 - **DirectStorage ordering.** Requests must run after `Submit`, in order with status and fence
   entries. Titles fill destination page-array entries after `EnqueueRequest`; an entry that is 0
   at enqueue is read again when the request runs.
+- **Sub-dword addressing (SDWA).** The translator lowers the byte and word selects of the 32-bit
+  integer VOP1/VOP2 SDWA forms: a source selection is zero-extended, or sign-extended under `sext()`,
+  and the low bits of the result are placed in the destination field, with `UNUSED_PAD` zeroing the
+  others and `UNUSED_PRESERVE` keeping them. The selection helpers match `tools/pixel_aot.py`, which
+  already lowers the same forms. Float SDWA forms and a `dst_unused:UNUSED_SEXT` destination still
+  stop translation rather than translating to something inexact. [#1141](https://github.com/R0Y00/Xbox2Windows/issues/1141)
 - **Soft asserts.** Retail code keeps `int3` instructions followed by a continuation. Without a
   debugger the title's handler steps over them; under the startup debugger use
   `-ContinueAsserts N`. One of them fires about ten times a second in the texture-streaming path

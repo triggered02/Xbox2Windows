@@ -20,6 +20,38 @@ class Unsupported(Exception):
 
 PREFETCH = bytes.fromhex('0300a0bf')
 
+# SDWA (sub-dword addressing) selections, with the same meaning as tools/pixel_aot.py: a source
+# selection is zero-extended, or sign-extended under sext(); a destination selection writes the low
+# bits of the result into that field, UNUSED_PAD zeroes the others and UNUSED_PRESERVE keeps them.
+SDWA_SEL = {'BYTE_0': (0, 8), 'BYTE_1': (8, 8), 'BYTE_2': (16, 8), 'BYTE_3': (24, 8),
+            'WORD_0': (0, 16), 'WORD_1': (16, 16), 'DWORD': (0, 32)}
+
+
+def sdwa_source(word, sel, sext):
+    """The uint expression a source selection reads out of a 32-bit register."""
+    offset, width = SDWA_SEL[sel]
+    if width == 32:
+        return word
+    if sext:
+        return 'asuint(asint(%s << %du) >> %du)' % (word, 32 - offset - width, 32 - width)
+    return '((%s >> %du) & %#xu)' % (word, offset, (1 << width) - 1)
+
+
+def sdwa_dest(result, sel, unused, old):
+    """The uint expression a destination selection writes back into a 32-bit register."""
+    offset, width = SDWA_SEL[sel]
+    if width == 32:
+        return result
+    if unused == 'UNUSED_SEXT':
+        raise Unsupported('SDWA UNUSED_SEXT')
+    field = '((%s & %#xu) << %du)' % (result, (1 << width) - 1, offset)
+    if unused == 'UNUSED_PAD':
+        return field
+    if unused != 'UNUSED_PRESERVE':
+        raise Unsupported('SDWA dst_unused %s' % unused)
+    keep = ~(((1 << width) - 1) << offset) & 0xffffffff
+    return '((asuint(%s) & %#xu) | %s)' % (old, keep, field)
+
 
 def strip_header(code):
     at = code.find(PREFETCH, 0, 0x80)
@@ -303,6 +335,8 @@ class Stage:
             return handler(ops, mods)
         if base.startswith('v_cmp'):
             return self.compare(base, ops)
+        if base.endswith('_sdwa'):
+            return self.sdwa(base[:-len('_sdwa')], ops, mods)
         if base in VEC_F:
             arity, text = VEC_F[base]
             args = [self.f(o) for o in ops[1:1 + arity]]
@@ -317,6 +351,42 @@ class Stage:
         if base in SCA:
             return self.scalar(base, ops)
         raise Unsupported(base)
+
+    # VOP1/VOP2 with sub-dword addressing: select the source fields, run the same operation, then place
+    # the low bits of the result in the destination field. The integer forms reuse VEC_U unchanged;
+    # float forms are not lowered yet, and dst_unused UNUSED_SEXT has no lowering.
+    def sdwa(self, base, ops, mods):
+        fields = {}
+        for m in mods:
+            key, _, value = m.partition(':')
+            if key in ('src0_sel', 'src1_sel', 'src2_sel', 'dst_sel', 'dst_unused') and value:
+                fields[key] = value
+            else:
+                raise Unsupported('%s with SDWA modifier %s' % (base, m))
+        if base not in VEC_U:
+            raise Unsupported('SDWA form of %s' % base)
+        arity, text = VEC_U[base]
+        sources = []
+        for index in range(arity):
+            token = ops[1 + index]
+            sext = token.startswith('sext(') and token.endswith(')')
+            if sext:
+                token = token[len('sext('):-1]
+            selection = fields.get('src%d_sel' % index)
+            if not selection:
+                raise Unsupported('%s SDWA without src%d_sel' % (base, index))
+            sources.append(sdwa_source(self.u(token), selection, sext))
+        result = text.format(*sources)
+        select = fields.get('dst_sel')
+        if not select:
+            raise Unsupported('%s SDWA without dst_sel' % base)
+        # The operation's HLSL carries its own operators, so it has to be grouped before the
+        # destination field masks it: "v7 | v8 & 0xffff" would otherwise bind as "v7 | (v8 & 0xffff)".
+        if SDWA_SEL[select][1] < 32:
+            result = '(%s)' % result
+        destination = reg_range(ops[0])[1]
+        self.set_v(destination, sdwa_dest(result, select, fields.get('dst_unused', 'UNUSED_PAD'),
+                                          'v%d' % destination))
 
     # scalar ALU with descriptor-word bookkeeping
     def scalar(self, base, ops):
